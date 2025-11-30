@@ -35,6 +35,12 @@ var raidCount = make(map[geo.AreaName]map[int64]*areaRaidCountDetail)
 var invasionCount = make(map[geo.AreaName]*areaInvasionCountDetail)
 var questCount = make(map[geo.AreaName]map[int]areaQuestCountDetail)
 
+// Hourly stats maps - mirror the daily maps but flushed hourly
+var pokemonCountHourly = make(map[geo.AreaName]*areaPokemonCountDetail)
+var raidCountHourly = make(map[geo.AreaName]map[int64]*areaRaidCountDetail)
+var invasionCountHourly = make(map[geo.AreaName]*areaInvasionCountDetail)
+var questCountHourly = make(map[geo.AreaName]map[int]areaQuestCountDetail)
+
 // max dex id
 const maxPokemonNo = 1050
 const maxInvasionCharacter = 523
@@ -82,6 +88,12 @@ var pokemonStatsLock sync.Mutex
 var raidStatsLock sync.Mutex
 var incidentStatsLock sync.Mutex
 var questStatsLock sync.Mutex
+
+// Hourly stats locks - separate from daily to avoid contention
+var pokemonStatsHourlyLock sync.Mutex
+var raidStatsHourlyLock sync.Mutex
+var incidentStatsHourlyLock sync.Mutex
+var questStatsHourlyLock sync.Mutex
 
 func initLiveStats() {
 	encounterCache = encounter_cache.NewEncounterCache(60 * time.Minute)
@@ -139,13 +151,48 @@ func StartStatsWriter(statsDb *sqlx.DB) {
 			logQuestStats(statsDb)
 		}
 	}()
+
+	// Hourly stats writers - flush accumulated hourly stats to database
+	hourlyTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			<-hourlyTicker.C
+			logPokemonCountHourly(statsDb)
+		}
+	}()
+
+	hourlyRaidTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			<-hourlyRaidTicker.C
+			logRaidStatsHourly(statsDb)
+		}
+	}()
+
+	hourlyInvasionTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			<-hourlyInvasionTicker.C
+			logInvasionStatsHourly(statsDb)
+		}
+	}()
+
+	hourlyQuestTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			<-hourlyQuestTicker.C
+			logQuestStatsHourly(statsDb)
+		}
+	}()
 }
 
 func ReloadGeofenceAndClearStats() {
 	log.Info("Reloading stats geofence")
 
 	pokemonStatsLock.Lock()
+	pokemonStatsHourlyLock.Lock()
 	defer pokemonStatsLock.Unlock()
+	defer pokemonStatsHourlyLock.Unlock()
 
 	if err := ReadGeofences(); err != nil {
 		log.Errorf("Error reading geofences during hot-reload: %v", err)
@@ -153,6 +200,9 @@ func ReloadGeofenceAndClearStats() {
 	}
 	pokemonStats = make(map[geo.AreaName]areaStatsCount)          // clear stats
 	pokemonCount = make(map[geo.AreaName]*areaPokemonCountDetail) // clear count
+
+	// Clear hourly stats as well
+	pokemonCountHourly = make(map[geo.AreaName]*areaPokemonCountDetail)
 }
 
 // update stats for an encounterId
@@ -198,7 +248,7 @@ func updateEncounterStats(pokemon *Pokemon) {
 		formIdStr = strconv.Itoa(int(pokemon.Form.ValueOrZero()))
 	}
 
-	// For the DB
+	// For the DB (daily stats)
 	func() {
 		areaName := geo.AreaName{Parent: "world", Name: "world"}
 
@@ -215,6 +265,35 @@ func updateEncounterStats(pokemon *Pokemon) {
 				shinyChecks: make(map[pokemonForm]shinyChecks),
 			}
 			pokemonCount[areaName] = countStats
+		}
+
+		pf := pokemonForm{pokemonId: pokemon.PokemonId, formId: formId}
+
+		entry := countStats.shinyChecks[pf]
+		entry.total++
+		if pokemon.Shiny.ValueOrZero() {
+			entry.shiny++
+		}
+		countStats.shinyChecks[pf] = entry
+	}()
+
+	// For the DB (hourly stats)
+	func() {
+		areaName := geo.AreaName{Parent: "world", Name: "world"}
+
+		pokemonStatsHourlyLock.Lock()
+		defer pokemonStatsHourlyLock.Unlock()
+
+		countStats, exists := pokemonCountHourly[areaName]
+		if !exists {
+			countStats = &areaPokemonCountDetail{
+				hundos:      make(map[pokemonForm]int),
+				nundos:      make(map[pokemonForm]int),
+				count:       make(map[pokemonForm]int),
+				ivCount:     make(map[pokemonForm]int),
+				shinyChecks: make(map[pokemonForm]shinyChecks),
+			}
+			pokemonCountHourly[areaName] = countStats
 		}
 
 		pf := pokemonForm{pokemonId: pokemon.PokemonId, formId: formId}
@@ -367,7 +446,7 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 		area := areas[i]
 		fullAreaName := area.String()
 
-		// Count stats
+		// Count stats (daily)
 
 		if old == nil || old.Cp != new.Cp { // pokemon is new or CP has changed (encountered or re-encountered)
 			if !locked {
@@ -446,6 +525,51 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 	if locked {
 		pokemonStatsLock.Unlock()
 	}
+
+	// Hourly count stats - update separately with its own lock
+	hourlyLocked := false
+	for i := 0; i < len(areas); i++ {
+		area := areas[i]
+
+		if old == nil || old.Cp != new.Cp { // pokemon is new or CP has changed (encountered or re-encountered)
+			if !hourlyLocked {
+				pokemonStatsHourlyLock.Lock()
+				hourlyLocked = true
+			}
+
+			countStats, exists := pokemonCountHourly[area]
+			if !exists {
+				countStats = &areaPokemonCountDetail{
+					hundos:      make(map[pokemonForm]int),
+					nundos:      make(map[pokemonForm]int),
+					count:       make(map[pokemonForm]int),
+					ivCount:     make(map[pokemonForm]int),
+					shinyChecks: make(map[pokemonForm]shinyChecks),
+				}
+				pokemonCountHourly[area] = countStats
+			}
+
+			formId := int(new.Form.ValueOrZero())
+			pf := pokemonForm{pokemonId: new.PokemonId, formId: formId}
+
+			if old == nil || old.PokemonId != new.PokemonId { // pokemon is new or type has changed
+				countStats.count[pf]++
+			}
+
+			if new.Cp.Valid {
+				countStats.ivCount[pf]++
+				if isHundo {
+					countStats.hundos[pf]++
+				} else if isNundo {
+					countStats.nundos[pf]++
+				}
+			}
+		}
+	}
+
+	if hourlyLocked {
+		pokemonStatsHourlyLock.Unlock()
+	}
 }
 
 func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
@@ -486,6 +610,40 @@ func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
 	if locked {
 		raidStatsLock.Unlock()
 	}
+
+	// Hourly raid stats
+	hourlyLocked := false
+
+	for i := 0; i < len(areas); i++ {
+		area := areas[i]
+
+		if new.RaidPokemonId.ValueOrZero() > 0 &&
+			(old == nil || old.RaidPokemonId != new.RaidPokemonId || old.RaidEndTimestamp != new.RaidEndTimestamp) {
+
+			if !hourlyLocked {
+				raidStatsHourlyLock.Lock()
+				hourlyLocked = true
+			}
+
+			if raidCountHourly[area] == nil {
+				raidCountHourly[area] = make(map[int64]*areaRaidCountDetail)
+			}
+			countStats := raidCountHourly[area]
+			raidLevel := new.RaidLevel.ValueOrZero()
+			if countStats[raidLevel] == nil {
+				countStats[raidLevel] = &areaRaidCountDetail{count: make(map[pokemonForm]int)}
+			}
+			pf := pokemonForm{
+				pokemonId: int16(new.RaidPokemonId.ValueOrZero()),
+				formId:    int(new.RaidPokemonForm.ValueOrZero()),
+			}
+			countStats[raidLevel].count[pf]++
+		}
+	}
+
+	if hourlyLocked {
+		raidStatsHourlyLock.Unlock()
+	}
 }
 
 func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
@@ -505,7 +663,7 @@ func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
 
 	locked := false
 
-	// Loop though all areas
+	// Loop though all areas (daily stats)
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
@@ -532,6 +690,35 @@ func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
 
 	if locked {
 		incidentStatsLock.Unlock()
+	}
+
+	// Hourly invasion stats
+	hourlyLocked := false
+
+	for i := 0; i < len(areas); i++ {
+		area := areas[i]
+
+		if old == nil || old.StartTime != new.StartTime {
+
+			if !hourlyLocked {
+				incidentStatsHourlyLock.Lock()
+				hourlyLocked = true
+			}
+
+			invasionStats := invasionCountHourly[area]
+			if invasionStats == nil {
+				invasionStats = &areaInvasionCountDetail{}
+				invasionCountHourly[area] = invasionStats
+			}
+
+			if new.Character != 0 {
+				invasionStats.count[new.Character]++
+			}
+		}
+	}
+
+	if hourlyLocked {
+		incidentStatsHourlyLock.Unlock()
 	}
 }
 
@@ -575,7 +762,7 @@ func updateQuestStats(pokestop *Pokestop, haveAr bool, areas []geo.AreaName) {
 
 	locked := false
 
-	// Loop though all areas
+	// Loop though all areas (daily stats)
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
@@ -614,6 +801,48 @@ func updateQuestStats(pokestop *Pokestop, haveAr bool, areas []geo.AreaName) {
 
 	if locked {
 		questStatsLock.Unlock()
+	}
+
+	// Hourly quest stats
+	hourlyLocked := false
+
+	for i := 0; i < len(areas); i++ {
+		area := areas[i]
+
+		if !hourlyLocked {
+			questStatsHourlyLock.Lock()
+			hourlyLocked = true
+		}
+
+		countStats := questCountHourly[area]
+		if countStats == nil {
+			countStats = make(map[int]areaQuestCountDetail)
+			questCountHourly[area] = countStats
+		}
+
+		for _, item := range data {
+			var countQuests = questCountHourly[area][item.Type]
+
+			if item.Info.PokemonID != 0 {
+				if countQuests.pokemonDetails[item.Info.PokemonID] == nil {
+					countQuests.pokemonDetails[item.Info.PokemonID] = make(map[int]int)
+				}
+				countQuests.pokemonDetails[item.Info.PokemonID][item.Info.Amount]++
+			} else if item.Info.ItemID != 0 || item.Info.Amount != 0 {
+				if countQuests.itemDetails[item.Info.ItemID] == nil {
+					countQuests.itemDetails[item.Info.ItemID] = make(map[int]int)
+				}
+				countQuests.itemDetails[item.Info.ItemID][item.Info.Amount]++
+			} else {
+				countQuests.count++
+			}
+
+			questCountHourly[area][item.Type] = countQuests
+		}
+	}
+
+	if hourlyLocked {
+		questStatsHourlyLock.Unlock()
 	}
 }
 
@@ -1059,6 +1288,365 @@ func logQuestStats(statsDb *sqlx.DB) {
 			)
 			if err != nil {
 				log.Errorf("Error inserting quest_stats: %v", err)
+			}
+		}
+	}()
+}
+
+// Hourly stats DB row types
+type pokemonCountHourlyDbRow struct {
+	DateTime  string `db:"datetime"`
+	Area      string `db:"area"`
+	Fence     string `db:"fence"`
+	PokemonId int    `db:"pokemon_id"`
+	FormId    int    `db:"form_id"`
+	Count     int    `db:"count"`
+}
+
+type pokemonShinyCountHourlyDbRow struct {
+	DateTime  string `db:"datetime"`
+	Area      string `db:"area"`
+	Fence     string `db:"fence"`
+	PokemonId int    `db:"pokemon_id"`
+	FormId    int    `db:"form_id"`
+	Count     int    `db:"count"`
+	Total     int    `db:"total"`
+}
+
+type raidStatsHourlyDbRow struct {
+	DateTime  string `db:"datetime"`
+	Area      string `db:"area"`
+	Fence     string `db:"fence"`
+	Level     int64  `db:"level"`
+	PokemonId int    `db:"pokemon_id"`
+	FormId    int    `db:"form_id"`
+	Count     int    `db:"count"`
+}
+
+type invasionStatsHourlyDbRow struct {
+	DateTime  string `db:"datetime"`
+	Area      string `db:"area"`
+	Fence     string `db:"fence"`
+	Character int    `db:"character"`
+	Count     int    `db:"count"`
+}
+
+type questStatsHourlyDbRow struct {
+	DateTime   string `db:"datetime"`
+	Area       string `db:"area"`
+	Fence      string `db:"fence"`
+	RewardType int    `db:"reward_type"`
+	PokemonId  int    `db:"pokemon_id"`
+	ItemId     int    `db:"item_id"`
+	ItemAmount int    `db:"item_amount"`
+	Count      int    `db:"count"`
+}
+
+func logPokemonCountHourly(statsDb *sqlx.DB) {
+
+	log.Infof("STATS: Update hourly pokemon count tables")
+
+	pokemonStatsHourlyLock.Lock()
+	currentStats := pokemonCountHourly
+	pokemonCountHourly = make(map[geo.AreaName]*areaPokemonCountDetail) // clear stats
+	pokemonStatsHourlyLock.Unlock()
+
+	go func() {
+		var hundoRows []pokemonCountHourlyDbRow
+		var shinyRows []pokemonShinyCountHourlyDbRow
+		var nundoRows []pokemonCountHourlyDbRow
+		var ivRows []pokemonCountHourlyDbRow
+		var allRows []pokemonCountHourlyDbRow
+
+		t := time.Now().In(time.Local).Truncate(time.Hour)
+		hourString := t.Format("2006-01-02 15:04:05")
+
+		for area, stats := range currentStats {
+			addRows := func(rows *[]pokemonCountHourlyDbRow, pf pokemonForm, count int) {
+				*rows = append(*rows, pokemonCountHourlyDbRow{
+					DateTime:  hourString,
+					Area:      area.Parent,
+					Fence:     area.Name,
+					PokemonId: int(pf.pokemonId),
+					FormId:    pf.formId,
+					Count:     count,
+				})
+			}
+
+			for pf, count := range stats.count {
+				if count > 0 {
+					addRows(&allRows, pf, count)
+				}
+			}
+
+			for pf, count := range stats.ivCount {
+				if count > 0 {
+					addRows(&ivRows, pf, count)
+				}
+			}
+
+			for pf, count := range stats.hundos {
+				if count > 0 {
+					addRows(&hundoRows, pf, count)
+				}
+			}
+
+			for pf, count := range stats.nundos {
+				if count > 0 {
+					addRows(&nundoRows, pf, count)
+				}
+			}
+
+			for pf, checks := range stats.shinyChecks {
+				if checks.total > 0 {
+					shinyRows = append(shinyRows, pokemonShinyCountHourlyDbRow{
+						DateTime:  hourString,
+						Area:      area.Parent,
+						Fence:     area.Name,
+						PokemonId: int(pf.pokemonId),
+						FormId:    pf.formId,
+						Count:     checks.shiny,
+						Total:     checks.total,
+					})
+				}
+			}
+		}
+
+		updatePokemonStatsCountHourly := func(table string, rows []pokemonCountHourlyDbRow) {
+			if len(rows) > 0 {
+				chunkSize := 100
+
+				for i := 0; i < len(rows); i += chunkSize {
+					end := i + chunkSize
+
+					if end > len(rows) {
+						end = len(rows)
+					}
+
+					rowsToWrite := rows[i:end]
+
+					_, err := statsDb.NamedExec(
+						fmt.Sprintf("INSERT INTO %s (datetime, area, fence, pokemon_id, form_id, `count`)"+
+							" VALUES (:datetime, :area, :fence, :pokemon_id, :form_id, :count)"+
+							" ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`);", table),
+						rowsToWrite,
+					)
+					if err != nil {
+						log.Errorf("Error inserting %s: %v", table, err)
+					}
+				}
+			}
+		}
+
+		updatePokemonStatsCountHourly("pokemon_stats_hourly", allRows)
+		updatePokemonStatsCountHourly("pokemon_iv_stats_hourly", ivRows)
+		updatePokemonStatsCountHourly("pokemon_hundo_stats_hourly", hundoRows)
+		updatePokemonStatsCountHourly("pokemon_nundo_stats_hourly", nundoRows)
+
+		if rows := shinyRows; len(rows) > 0 {
+			chunkSize := batchInsertSize
+
+			for i := 0; i < len(rows); i += chunkSize {
+				end := i + chunkSize
+
+				if end > len(rows) {
+					end = len(rows)
+				}
+
+				rowsToWrite := rows[i:end]
+
+				_, err := statsDb.NamedExec(
+					"INSERT INTO pokemon_shiny_stats_hourly (datetime, area, fence, pokemon_id, form_id, `count`, total)"+
+						" VALUES (:datetime, :area, :fence, :pokemon_id, :form_id, :count, :total)"+
+						" ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`), total = total + VALUES(total);",
+					rowsToWrite,
+				)
+				if err != nil {
+					log.Errorf("Error inserting pokemon_shiny_stats_hourly: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+func logRaidStatsHourly(statsDb *sqlx.DB) {
+	raidStatsHourlyLock.Lock()
+	log.Infof("STATS: Write hourly raid stats")
+
+	currentStats := raidCountHourly
+	raidCountHourly = make(map[geo.AreaName]map[int64]*areaRaidCountDetail) // clear stats
+	raidStatsHourlyLock.Unlock()
+
+	go func() {
+		var rows []raidStatsHourlyDbRow
+
+		t := time.Now().In(time.Local).Truncate(time.Hour)
+		hourString := t.Format("2006-01-02 15:04:05")
+
+		for area, stats := range currentStats {
+			addRows := func(rows *[]raidStatsHourlyDbRow, level int64, pokemonId int, formId int, count int) {
+				*rows = append(*rows, raidStatsHourlyDbRow{
+					DateTime:  hourString,
+					Area:      area.Parent,
+					Fence:     area.Name,
+					Level:     level,
+					PokemonId: pokemonId,
+					FormId:    formId,
+					Count:     count,
+				})
+			}
+
+			for level, raidDetail := range stats {
+				if raidDetail.count == nil {
+					continue
+				}
+				for pf, count := range raidDetail.count {
+					if count > 0 {
+						addRows(&rows, level, int(pf.pokemonId), pf.formId, count)
+					}
+				}
+			}
+		}
+
+		for i := 0; i < len(rows); i += batchInsertSize {
+			end := i + batchInsertSize
+			if end > len(rows) {
+				end = len(rows)
+			}
+
+			batchRows := rows[i:end]
+			_, err := statsDb.NamedExec(
+				"INSERT INTO raid_stats_hourly "+
+					"(datetime, area, fence, level, pokemon_id, form_id, `count`)"+
+					" VALUES (:datetime, :area, :fence, :level, :pokemon_id, :form_id, :count)"+
+					" ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`);", batchRows)
+			if err != nil {
+				log.Errorf("Error inserting raid_stats_hourly: %v", err)
+			}
+		}
+	}()
+}
+
+func logInvasionStatsHourly(statsDb *sqlx.DB) {
+	incidentStatsHourlyLock.Lock()
+	log.Infof("STATS: Write hourly invasion stats")
+
+	currentStats := invasionCountHourly
+	invasionCountHourly = make(map[geo.AreaName]*areaInvasionCountDetail) // clear stats
+	incidentStatsHourlyLock.Unlock()
+
+	go func() {
+		var rows []invasionStatsHourlyDbRow
+
+		t := time.Now().In(time.Local).Truncate(time.Hour)
+		hourString := t.Format("2006-01-02 15:04:05")
+
+		for area, stats := range currentStats {
+			addRows := func(rows *[]invasionStatsHourlyDbRow, character int, count int) {
+				*rows = append(*rows, invasionStatsHourlyDbRow{
+					DateTime:  hourString,
+					Area:      area.Parent,
+					Fence:     area.Name,
+					Character: character,
+					Count:     count,
+				})
+			}
+
+			for character, count := range stats.count {
+				if count > 0 {
+					addRows(&rows, character, count)
+				}
+			}
+		}
+
+		for i := 0; i < len(rows); i += batchInsertSize {
+			end := i + batchInsertSize
+			if end > len(rows) {
+				end = len(rows)
+			}
+
+			batchRows := rows[i:end]
+			_, err := statsDb.NamedExec(
+				"INSERT INTO invasion_stats_hourly "+
+					"(datetime, area, fence, `character`, `count`)"+
+					" VALUES (:datetime, :area, :fence, :character, :count)"+
+					" ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`);", batchRows)
+			if err != nil {
+				log.Errorf("Error inserting invasion_stats_hourly: %v", err)
+			}
+		}
+	}()
+}
+
+func logQuestStatsHourly(statsDb *sqlx.DB) {
+	questStatsHourlyLock.Lock()
+	log.Infof("STATS: Write hourly quest stats")
+
+	currentStats := questCountHourly
+	questCountHourly = make(map[geo.AreaName]map[int]areaQuestCountDetail) // clear stats
+	questStatsHourlyLock.Unlock()
+
+	go func() {
+		var rows []questStatsHourlyDbRow
+
+		t := time.Now().In(time.Local).Truncate(time.Hour)
+		hourString := t.Format("2006-01-02 15:04:05")
+
+		for area, stats := range currentStats {
+			addRows := func(rows *[]questStatsHourlyDbRow, reward_type int, pokemon_id int, item_id int, item_amount int, count int) {
+				*rows = append(*rows, questStatsHourlyDbRow{
+					DateTime:   hourString,
+					Area:       area.Parent,
+					Fence:      area.Name,
+					RewardType: reward_type,
+					PokemonId:  pokemon_id,
+					ItemId:     item_id,
+					ItemAmount: item_amount,
+					Count:      count,
+				})
+			}
+
+			for reward_type := range stats {
+
+				if stats[reward_type].count > 0 {
+					addRows(&rows, reward_type, 0, 0, 0, stats[reward_type].count)
+				} else {
+
+					for pokemonId, amounts := range stats[reward_type].pokemonDetails {
+						for megaEnergyAmount, count := range amounts {
+							if count > 0 {
+								addRows(&rows, reward_type, pokemonId, 0, megaEnergyAmount, count)
+							}
+						}
+					}
+
+					for itemId, amounts := range stats[reward_type].itemDetails {
+						for itemAmount, count := range amounts {
+							if count > 0 {
+								addRows(&rows, reward_type, 0, itemId, itemAmount, count)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		for i := 0; i < len(rows); i += batchInsertSize {
+			end := i + batchInsertSize
+			if end > len(rows) {
+				end = len(rows)
+			}
+
+			batchRows := rows[i:end]
+			_, err := statsDb.NamedExec(
+				"INSERT INTO quest_stats_hourly "+
+					"(datetime, area, fence, reward_type, pokemon_id, item_id, item_amount, `count`) "+
+					"VALUES (:datetime, :area, :fence, :reward_type, :pokemon_id, :item_id, :item_amount, :count) "+
+					"ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`);",
+				batchRows,
+			)
+			if err != nil {
+				log.Errorf("Error inserting quest_stats_hourly: %v", err)
 			}
 		}
 	}()
