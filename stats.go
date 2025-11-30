@@ -148,12 +148,30 @@ func StartStatsExpiry(db *sqlx.DB) {
 				log.Infof("DB - Cleanup of pokemon_area_stats table took %s (%d rows)", elapsed, rows)
 			}
 
+			// Daily stats tables
 			tables := []string{"pokemon_stats", "pokemon_shiny_stats", "pokemon_iv_stats", "pokemon_hundo_stats", "pokemon_nundo_stats", "invasion_stats", "quest_stats", "raid_stats"}
 
 			for _, table := range tables {
 				start = time.Now()
 
 				result, err = db.Exec(fmt.Sprintf("DELETE FROM %s WHERE `date` < DATE(NOW() - INTERVAL %d DAY);", table, config.Config.Cleanup.StatsDays))
+				elapsed = time.Since(start)
+
+				if err != nil {
+					log.Errorf("DB - Cleanup of %s table error %s", table, err)
+				} else {
+					rows, _ := result.RowsAffected()
+					log.Infof("DB - Cleanup of %s table took %s (%d rows)", table, elapsed, rows)
+				}
+			}
+
+			// Hourly stats tables - use same retention period as daily stats
+			hourlyTables := []string{"pokemon_stats_hourly", "pokemon_shiny_stats_hourly", "pokemon_iv_stats_hourly", "pokemon_hundo_stats_hourly", "pokemon_nundo_stats_hourly", "invasion_stats_hourly", "quest_stats_hourly", "raid_stats_hourly"}
+
+			for _, table := range hourlyTables {
+				start = time.Now()
+
+				result, err = db.Exec(fmt.Sprintf("DELETE FROM %s WHERE `datetime` < DATE_SUB(NOW(), INTERVAL %d DAY);", table, config.Config.Cleanup.StatsDays))
 				elapsed = time.Since(start)
 
 				if err != nil {
