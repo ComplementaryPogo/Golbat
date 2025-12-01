@@ -35,6 +35,16 @@ db = ""
 [pvp]
 enabled = true
 include_hundos_under_cap = false
+# level_caps = [50, 51]
+# ranking_comparator = "prefer_higher_cp"  # Options: "prefer_higher_cp", "prefer_lower_cp", or omit for default
+
+# Track pokemon with excellent PVP ranks (within threshold) per league
+# This creates hourly stats in pokemon_excellent_pvp_stats_hourly table
+# Each league can have its own threshold - only leagues listed here will be tracked
+# [pvp.excellent_pvp_rank_threshold]
+# little = 3   # Track pokemon ranked 1-3 in Little League
+# great = 5    # Track pokemon ranked 1-5 in Great League
+# ultra = 10   # Track pokemon ranked 1-10 in Ultra League
 
 # you can enable prometheus by uncommenting this section
 #[prometheus]
