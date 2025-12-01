@@ -166,7 +166,7 @@ func StartStatsExpiry(db *sqlx.DB) {
 			}
 
 			// Hourly stats tables - use same retention period as daily stats
-			hourlyTables := []string{"pokemon_stats_hourly", "pokemon_shiny_stats_hourly", "pokemon_iv_stats_hourly", "pokemon_hundo_stats_hourly", "pokemon_nundo_stats_hourly", "invasion_stats_hourly", "quest_stats_hourly", "raid_stats_hourly"}
+			hourlyTables := []string{"pokemon_stats_hourly", "pokemon_shiny_stats_hourly", "pokemon_iv_stats_hourly", "pokemon_hundo_stats_hourly", "pokemon_nundo_stats_hourly", "invasion_stats_hourly", "quest_stats_hourly", "raid_stats_hourly", "pokemon_excellent_pvp_stats_hourly"}
 
 			for _, table := range hourlyTables {
 				start = time.Now()

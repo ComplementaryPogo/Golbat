@@ -9,9 +9,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/UnownHash/gohbem"
 	"github.com/jmoiron/sqlx"
 	log "github.com/sirupsen/logrus"
 
+	"golbat/config"
 	"golbat/encounter_cache"
 	"golbat/geo"
 )
@@ -94,6 +96,15 @@ var pokemonStatsHourlyLock sync.Mutex
 var raidStatsHourlyLock sync.Mutex
 var incidentStatsHourlyLock sync.Mutex
 var questStatsHourlyLock sync.Mutex
+
+// Excellent PVP stats (hourly only)
+// Key is pokemonForm, value is map of league name to count
+type areaPvpCountDetail struct {
+	excellentPvp map[pokemonForm]map[string]int // pokemonForm -> league -> count
+}
+
+var excellentPvpCountHourly = make(map[geo.AreaName]*areaPvpCountDetail)
+var excellentPvpStatsHourlyLock sync.Mutex
 
 func initLiveStats() {
 	encounterCache = encounter_cache.NewEncounterCache(60 * time.Minute)
@@ -184,6 +195,14 @@ func StartStatsWriter(statsDb *sqlx.DB) {
 			logQuestStatsHourly(statsDb)
 		}
 	}()
+
+	hourlyPvpTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			<-hourlyPvpTicker.C
+			logExcellentPvpStatsHourly(statsDb)
+		}
+	}()
 }
 
 func ReloadGeofenceAndClearStats() {
@@ -191,8 +210,10 @@ func ReloadGeofenceAndClearStats() {
 
 	pokemonStatsLock.Lock()
 	pokemonStatsHourlyLock.Lock()
+	excellentPvpStatsHourlyLock.Lock()
 	defer pokemonStatsLock.Unlock()
 	defer pokemonStatsHourlyLock.Unlock()
+	defer excellentPvpStatsHourlyLock.Unlock()
 
 	if err := ReadGeofences(); err != nil {
 		log.Errorf("Error reading geofences during hot-reload: %v", err)
@@ -203,6 +224,7 @@ func ReloadGeofenceAndClearStats() {
 
 	// Clear hourly stats as well
 	pokemonCountHourly = make(map[geo.AreaName]*areaPokemonCountDetail)
+	excellentPvpCountHourly = make(map[geo.AreaName]*areaPvpCountDetail)
 }
 
 // update stats for an encounterId
@@ -320,7 +342,7 @@ func updateEncounterStats(pokemon *Pokemon) {
 	}
 }
 
-func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now int64) {
+func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now int64, pvpResults map[string][]gohbem.PokemonEntry) {
 	if len(areas) == 0 {
 		areas = []geo.AreaName{
 			{
@@ -569,6 +591,52 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 
 	if hourlyLocked {
 		pokemonStatsHourlyLock.Unlock()
+	}
+
+	// Excellent PVP stats (hourly only)
+	// Only track if we have pvp results and thresholds are configured
+	if pvpResults != nil && len(config.Config.Pvp.ExcellentPvpRankThreshold) > 0 {
+		excellentPvpStatsHourlyLock.Lock()
+		formId := int(new.Form.ValueOrZero())
+		pf := pokemonForm{pokemonId: new.PokemonId, formId: formId}
+
+		for i := 0; i < len(areas); i++ {
+			area := areas[i]
+
+			countStats, exists := excellentPvpCountHourly[area]
+			if !exists {
+				countStats = &areaPvpCountDetail{
+					excellentPvp: make(map[pokemonForm]map[string]int),
+				}
+				excellentPvpCountHourly[area] = countStats
+			}
+
+			if countStats.excellentPvp[pf] == nil {
+				countStats.excellentPvp[pf] = make(map[string]int)
+			}
+
+			// Check each league for excellent PVP rank
+			for league, entries := range pvpResults {
+				threshold, hasThreshold := config.Config.Pvp.ExcellentPvpRankThreshold[league]
+				if !hasThreshold {
+					continue
+				}
+
+				// Find the best rank for this league across all level caps
+				var bestRank int16 = 4096
+				for _, entry := range entries {
+					if entry.Rank < bestRank {
+						bestRank = entry.Rank
+					}
+				}
+
+				// If the best rank is within the threshold, count it
+				if bestRank <= threshold {
+					countStats.excellentPvp[pf][league]++
+				}
+			}
+		}
+		excellentPvpStatsHourlyLock.Unlock()
 	}
 }
 
@@ -1647,6 +1715,70 @@ func logQuestStatsHourly(statsDb *sqlx.DB) {
 			)
 			if err != nil {
 				log.Errorf("Error inserting quest_stats_hourly: %v", err)
+			}
+		}
+	}()
+}
+
+// Excellent PVP stats DB row type
+type excellentPvpStatsHourlyDbRow struct {
+	DateTime  string `db:"datetime"`
+	Area      string `db:"area"`
+	Fence     string `db:"fence"`
+	PokemonId int    `db:"pokemon_id"`
+	FormId    int    `db:"form_id"`
+	League    string `db:"league"`
+	Count     int    `db:"count"`
+}
+
+func logExcellentPvpStatsHourly(statsDb *sqlx.DB) {
+	excellentPvpStatsHourlyLock.Lock()
+	log.Infof("STATS: Write hourly excellent PVP stats")
+
+	currentStats := excellentPvpCountHourly
+	excellentPvpCountHourly = make(map[geo.AreaName]*areaPvpCountDetail) // clear stats
+	excellentPvpStatsHourlyLock.Unlock()
+
+	go func() {
+		var rows []excellentPvpStatsHourlyDbRow
+
+		t := time.Now().In(time.Local).Truncate(time.Hour)
+		hourString := t.Format("2006-01-02 15:04:05")
+
+		for area, stats := range currentStats {
+			for pf, leagueCounts := range stats.excellentPvp {
+				for league, count := range leagueCounts {
+					if count > 0 {
+						rows = append(rows, excellentPvpStatsHourlyDbRow{
+							DateTime:  hourString,
+							Area:      area.Parent,
+							Fence:     area.Name,
+							PokemonId: int(pf.pokemonId),
+							FormId:    pf.formId,
+							League:    league,
+							Count:     count,
+						})
+					}
+				}
+			}
+		}
+
+		for i := 0; i < len(rows); i += batchInsertSize {
+			end := i + batchInsertSize
+			if end > len(rows) {
+				end = len(rows)
+			}
+
+			batchRows := rows[i:end]
+			_, err := statsDb.NamedExec(
+				"INSERT INTO pokemon_excellent_pvp_stats_hourly "+
+					"(datetime, area, fence, pokemon_id, form_id, league, `count`) "+
+					"VALUES (:datetime, :area, :fence, :pokemon_id, :form_id, :league, :count) "+
+					"ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`);",
+				batchRows,
+			)
+			if err != nil {
+				log.Errorf("Error inserting pokemon_excellent_pvp_stats_hourly: %v", err)
 			}
 		}
 	}()
