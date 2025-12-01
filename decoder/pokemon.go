@@ -403,7 +403,7 @@ func savePokemonRecordAsAtTime(ctx context.Context, db db.DbDetails, pokemon *Po
 	if webhook {
 		createPokemonWebhooks(ctx, db, oldPokemon, pokemon, areas)
 	}
-	updatePokemonStats(oldPokemon, pokemon, areas, now)
+	updatePokemonStats(oldPokemon, pokemon, areas, now, pvpResults)
 
 	pokemon.Pvp = null.NewString("", false) // Reset PVP field to avoid keeping it in memory cache
 

@@ -67,10 +67,11 @@ type Webhook struct {
 }
 
 type pvp struct {
-	Enabled               bool   `koanf:"enabled"`
-	IncludeHundosUnderCap bool   `koanf:"include_hundos_under_cap"`
-	LevelCaps             []int  `koanf:"level_caps"`
-	RankingComparator     string `koanf:"ranking_comparator"`
+	Enabled                   bool              `koanf:"enabled"`
+	IncludeHundosUnderCap     bool              `koanf:"include_hundos_under_cap"`
+	LevelCaps                 []int             `koanf:"level_caps"`
+	RankingComparator         string            `koanf:"ranking_comparator"`
+	ExcellentPvpRankThreshold map[string]int16  `koanf:"excellent_pvp_rank_threshold"`
 }
 
 type sentry struct {
