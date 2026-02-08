@@ -213,3 +213,59 @@ func UpdateFortRecordWithGetMapFortsOutProto(ctx context.Context, db db.DbDetail
 	}
 	return status, output
 }
+
+// copySharedFieldsFrom copies shared fields from a pokestop to a gym during conversion
+func (gym *Gym) copySharedFieldsFrom(pokestop *Pokestop) {
+	if pokestop.Name.Valid && !gym.Name.Valid {
+		gym.Name = pokestop.Name
+	}
+	if pokestop.Url.Valid && !gym.Url.Valid {
+		gym.Url = pokestop.Url
+	}
+	if pokestop.Description.Valid && !gym.Description.Valid {
+		gym.Description = pokestop.Description
+	}
+	if pokestop.PartnerId.Valid && !gym.PartnerId.Valid {
+		gym.PartnerId = pokestop.PartnerId
+	}
+	if pokestop.ArScanEligible.Valid && !gym.ArScanEligible.Valid {
+		gym.ArScanEligible = pokestop.ArScanEligible
+	}
+	if pokestop.PowerUpLevel.Valid && !gym.PowerUpLevel.Valid {
+		gym.PowerUpLevel = pokestop.PowerUpLevel
+	}
+	if pokestop.PowerUpPoints.Valid && !gym.PowerUpPoints.Valid {
+		gym.PowerUpPoints = pokestop.PowerUpPoints
+	}
+	if pokestop.PowerUpEndTimestamp.Valid && !gym.PowerUpEndTimestamp.Valid {
+		gym.PowerUpEndTimestamp = pokestop.PowerUpEndTimestamp
+	}
+}
+
+// copySharedFieldsFrom copies shared fields from a gym to a pokestop during conversion
+func (stop *Pokestop) copySharedFieldsFrom(gym *Gym) {
+	if gym.Name.Valid && !stop.Name.Valid {
+		stop.Name = gym.Name
+	}
+	if gym.Url.Valid && !stop.Url.Valid {
+		stop.Url = gym.Url
+	}
+	if gym.Description.Valid && !stop.Description.Valid {
+		stop.Description = gym.Description
+	}
+	if gym.PartnerId.Valid && !stop.PartnerId.Valid {
+		stop.PartnerId = gym.PartnerId
+	}
+	if gym.ArScanEligible.Valid && !stop.ArScanEligible.Valid {
+		stop.ArScanEligible = gym.ArScanEligible
+	}
+	if gym.PowerUpLevel.Valid && !stop.PowerUpLevel.Valid {
+		stop.PowerUpLevel = gym.PowerUpLevel
+	}
+	if gym.PowerUpPoints.Valid && !stop.PowerUpPoints.Valid {
+		stop.PowerUpPoints = gym.PowerUpPoints
+	}
+	if gym.PowerUpEndTimestamp.Valid && !stop.PowerUpEndTimestamp.Valid {
+		stop.PowerUpEndTimestamp = gym.PowerUpEndTimestamp
+	}
+}

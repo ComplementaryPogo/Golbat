@@ -252,6 +252,16 @@ func main() {
 		StartStatsExpiry(db)
 	}
 
+	// init fort tracker for memory-based fort cleanup
+	staleThreshold := cfg.Cleanup.FortsStaleThreshold
+	if staleThreshold <= 0 {
+		staleThreshold = 3600 // def 1 hour
+	}
+	decoder.InitFortTracker(staleThreshold)
+	if err := decoder.LoadFortsFromDB(ctx, dbDetails); err != nil {
+		log.Errorf("failed to load forts into tracker: %s", err)
+	}
+
 	if cfg.TestFortInMemory {
 		go decoder.LoadAllPokestops(dbDetails)
 		go decoder.LoadAllGyms(dbDetails)
@@ -849,18 +859,39 @@ func decodeGMO(ctx context.Context, protoData *ProtoData, scanParameters decoder
 	var newMapCells []uint64
 	var cellsToBeCleaned []uint64
 
+	// track forts per cell for memory-based cleanup (only if tracker enabled)
+	cellForts := make(map[uint64]*decoder.FortTrackerGMOContents)
+
 	if len(decodedGmo.MapCell) == 0 {
 		return "Skipping GetMapObjectsOutProto: No map cells found"
 	}
 	for _, mapCell := range decodedGmo.MapCell {
+		// initialize cell forts tracking for every map cell (so empty fort lists are seen as "no forts")
+		cellForts[mapCell.S2CellId] = &decoder.FortTrackerGMOContents{
+			Pokestops: make([]string, 0),
+			Gyms:      make([]string, 0),
+			Timestamp: mapCell.AsOfTimeMs,
+		}
+		// always mark this mapCell to be checked for removed forts. Previously only cells with forts were
+		// added which meant an empty fort list (all forts removed) was never passed to the tracker.
+		cellsToBeCleaned = append(cellsToBeCleaned, mapCell.S2CellId)
+
 		if isCellNotEmpty(mapCell) {
 			newMapCells = append(newMapCells, mapCell.S2CellId)
-			if cellContainsForts(mapCell) {
-				cellsToBeCleaned = append(cellsToBeCleaned, mapCell.S2CellId)
-			}
 		}
+
 		for _, fort := range mapCell.Fort {
 			newForts = append(newForts, decoder.RawFortData{Cell: mapCell.S2CellId, Data: fort, Timestamp: mapCell.AsOfTimeMs})
+
+			// track fort by type for memory-based cleanup (only if tracker enabled)
+			if cf, ok := cellForts[mapCell.S2CellId]; ok {
+				switch fort.FortType {
+				case pogo.FortType_GYM:
+					cf.Gyms = append(cf.Gyms, fort.FortId)
+				case pogo.FortType_CHECKPOINT:
+					cf.Pokestops = append(cf.Pokestops, fort.FortId)
+				}
+			}
 
 			if fort.ActivePokemon != nil {
 				newMapPokemon = append(newMapPokemon, decoder.RawMapPokemonData{Cell: mapCell.S2CellId, Data: fort.ActivePokemon, Timestamp: mapCell.AsOfTimeMs})
@@ -882,7 +913,7 @@ func decodeGMO(ctx context.Context, protoData *ProtoData, scanParameters decoder
 	}
 	var weatherUpdates []decoder.WeatherUpdate
 	if scanParameters.ProcessWeather {
-		weatherUpdates = decoder.UpdateClientWeatherBatch(ctx, dbDetails, decodedGmo.ClientWeather, decodedGmo.MapCell[0].AsOfTimeMs)
+		weatherUpdates = decoder.UpdateClientWeatherBatch(ctx, dbDetails, decodedGmo.ClientWeather, decodedGmo.MapCell[0].AsOfTimeMs, protoData.Account)
 	}
 	if scanParameters.ProcessPokemon {
 		decoder.UpdatePokemonBatch(ctx, dbDetails, scanParameters, newWildPokemon, newNearbyPokemon, newMapPokemon, decodedGmo.ClientWeather, protoData.Account)
@@ -902,13 +933,14 @@ func decodeGMO(ctx context.Context, protoData *ProtoData, scanParameters decoder
 
 	if scanParameters.ProcessCells {
 		decoder.UpdateClientMapS2CellBatch(ctx, dbDetails, newMapCells)
-		if scanParameters.ProcessGyms || scanParameters.ProcessPokestops {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				decoder.ClearRemovedForts(ctx, dbDetails, cellsToBeCleaned)
-			}()
-		}
+	}
+
+	if scanParameters.ProcessGyms || scanParameters.ProcessPokestops {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			decoder.CheckRemovedForts(ctx, dbDetails, cellsToBeCleaned, cellForts)
+		}()
 	}
 
 	newFortsLen := len(newForts)
