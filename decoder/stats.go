@@ -68,8 +68,14 @@ type areaPokemonCountDetail struct {
 	ivCount     map[pokemonForm]int
 }
 
+type raidPokemonKey struct {
+	pokemonId int16
+	formId    int
+	tempEvoId int
+}
+
 type areaRaidCountDetail struct {
-	count map[pokemonForm]int
+	count map[raidPokemonKey]int
 }
 
 type areaInvasionCountDetail struct {
@@ -123,7 +129,7 @@ func LoadStatsGeofences() {
 }
 
 func StartStatsWriter(statsDb *sqlx.DB) {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(time.Duration(config.Config.StatsIntervals.PokemonStatsIntervalMinutes) * time.Minute)
 	go func() {
 		for {
 			<-ticker.C
@@ -131,7 +137,7 @@ func StartStatsWriter(statsDb *sqlx.DB) {
 		}
 	}()
 
-	t2 := time.NewTicker(10 * time.Minute)
+	t2 := time.NewTicker(time.Duration(config.Config.StatsIntervals.PokemonCountIntervalMinutes) * time.Minute)
 	go func() {
 		for {
 			<-t2.C
@@ -139,7 +145,7 @@ func StartStatsWriter(statsDb *sqlx.DB) {
 		}
 	}()
 
-	t4 := time.NewTicker(10 * time.Minute)
+	t4 := time.NewTicker(time.Duration(config.Config.StatsIntervals.RaidStatsIntervalMinutes) * time.Minute)
 	go func() {
 		for {
 			<-t4.C
@@ -147,7 +153,7 @@ func StartStatsWriter(statsDb *sqlx.DB) {
 		}
 	}()
 
-	t5 := time.NewTicker(15 * time.Minute)
+	t5 := time.NewTicker(time.Duration(config.Config.StatsIntervals.InvasionStatsIntervalMinutes) * time.Minute)
 	go func() {
 		for {
 			<-t5.C
@@ -155,7 +161,7 @@ func StartStatsWriter(statsDb *sqlx.DB) {
 		}
 	}()
 
-	t6 := time.NewTicker(15 * time.Minute)
+	t6 := time.NewTicker(time.Duration(config.Config.StatsIntervals.QuestStatsIntervalMinutes) * time.Minute)
 	go func() {
 		for {
 			<-t6.C
@@ -245,7 +251,7 @@ func updateEncounterStats(pokemon *Pokemon) {
 		username = "<NoUsername>"
 	}
 
-	encounterCacheVal := encounterCache.GetOrCreate(pokemon.Id)
+	encounterCacheVal := encounterCache.GetOrCreate(uint64(pokemon.Id))
 	isNewEncounter := encounterCacheVal.NumAccountsSeen() == 0
 
 	if encounterCacheVal.SetAccountSeen(pokemon.Username.ValueOrZero()) {
@@ -260,7 +266,7 @@ func updateEncounterStats(pokemon *Pokemon) {
 		statsCollector.IncDuplicateEncounters(false)
 	}
 
-	encounterCache.Put(pokemon.Id, encounterCacheVal, pokemon.remainingDuration(time.Now().Unix()))
+	encounterCache.Put(uint64(pokemon.Id), encounterCacheVal, pokemon.remainingDuration(time.Now().Unix()))
 
 	pokemonIdStr := strconv.Itoa(int(pokemon.PokemonId))
 	var formId int
@@ -342,7 +348,7 @@ func updateEncounterStats(pokemon *Pokemon) {
 	}
 }
 
-func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now int64, pvpResults map[string][]gohbem.PokemonEntry) {
+func updatePokemonStats(pokemon *Pokemon, areas []geo.AreaName, now int64, pvpResults map[string][]gohbem.PokemonEntry) {
 	if len(areas) == 0 {
 		areas = []geo.AreaName{
 			{
@@ -374,15 +380,12 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 
 	populateEncounterCacheVal := func() {
 		if encounterCacheVal == nil {
-			encounterCacheVal = encounterCache.GetOrCreate(new.Id)
+			encounterCacheVal = encounterCache.GetOrCreate(uint64(pokemon.Id))
 		}
 	}
 
-	currentSeenType := new.SeenType.ValueOrZero()
-	oldSeenType := ""
-	if old != nil {
-		oldSeenType = old.SeenType.ValueOrZero()
-	}
+	currentSeenType := pokemon.SeenType.ValueOrZero()
+	oldSeenType := pokemon.oldValues.SeenType.ValueOrZero()
 
 	if currentSeenType != oldSeenType {
 		if oldSeenType == "" || oldSeenType == SeenType_NearbyStop || oldSeenType == SeenType_Cell {
@@ -392,7 +395,7 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 				// transition to wild for the first time..
 				populateEncounterCacheVal()
 				encounterCacheVal.FirstEncounter = 0
-				encounterCacheVal.FirstWild = new.Updated.ValueOrZero()
+				encounterCacheVal.FirstWild = pokemon.Updated.ValueOrZero()
 				// This will be put into the cache later.
 			}
 
@@ -406,7 +409,7 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 			populateEncounterCacheVal()
 			if encounterCacheVal.FirstEncounter == 0 {
 				// This is first encounter
-				encounterCacheVal.FirstEncounter = new.Updated.ValueOrZero()
+				encounterCacheVal.FirstEncounter = pokemon.Updated.ValueOrZero()
 
 				if encounterCacheVal.FirstWild > 0 {
 					timeToEncounter = encounterCacheVal.FirstEncounter - encounterCacheVal.FirstWild
@@ -414,8 +417,8 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 
 				monsIvIncr = 1
 
-				if new.ExpireTimestampVerified {
-					tth := new.ExpireTimestamp.ValueOrZero() - new.Updated.ValueOrZero() // relies on Updated being set
+				if pokemon.ExpireTimestampVerified {
+					tth := pokemon.ExpireTimestamp.ValueOrZero() - pokemon.Updated.ValueOrZero() // relies on Updated being set
 					bucket = tth / (5 * 60)
 					if bucket > 11 {
 						bucket = 11
@@ -426,8 +429,8 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 					unverifiedEncIncr = 1
 				}
 			} else {
-				if new.ExpireTimestampVerified {
-					tth := new.ExpireTimestamp.ValueOrZero() - new.Updated.ValueOrZero() // relies on Updated being set
+				if pokemon.ExpireTimestampVerified {
+					tth := pokemon.ExpireTimestamp.ValueOrZero() - pokemon.Updated.ValueOrZero() // relies on Updated being set
 
 					verifiedReEncounterIncr = 1
 					verifiedReEncSecTotalIncr = tth
@@ -438,12 +441,12 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 
 	// If we have a cache entry, it means we updated it. So now let's store it.
 	if encounterCacheVal != nil {
-		encounterCache.Put(new.Id, encounterCacheVal, new.remainingDuration(now))
+		encounterCache.Put(uint64(pokemon.Id), encounterCacheVal, pokemon.remainingDuration(now))
 	}
 
 	if (currentSeenType == SeenType_Wild && oldSeenType == SeenType_Encounter) ||
 		(currentSeenType == SeenType_Encounter && oldSeenType == SeenType_Encounter &&
-			new.PokemonId != old.PokemonId) {
+			pokemon.PokemonId != pokemon.oldValues.PokemonId) {
 		// stats reset
 		statsResetCountIncr = 1
 	}
@@ -453,10 +456,10 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 	var isHundo bool
 	var isNundo bool
 
-	if new.Cp.Valid && new.AtkIv.Valid && new.DefIv.Valid && new.StaIv.Valid {
-		atk := new.AtkIv.ValueOrZero()
-		def := new.DefIv.ValueOrZero()
-		sta := new.StaIv.ValueOrZero()
+	if pokemon.Cp.Valid && pokemon.AtkIv.Valid && pokemon.DefIv.Valid && pokemon.StaIv.Valid {
+		atk := pokemon.AtkIv.ValueOrZero()
+		def := pokemon.DefIv.ValueOrZero()
+		sta := pokemon.StaIv.ValueOrZero()
 		if atk == 15 && def == 15 && sta == 15 {
 			isHundo = true
 		} else if atk == 0 && def == 0 && sta == 0 {
@@ -470,7 +473,7 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 
 		// Count stats (daily)
 
-		if old == nil || old.Cp != new.Cp { // pokemon is new or CP has changed (encountered or re-encountered)
+		if pokemon.isNewRecord() || pokemon.oldValues.Cp != pokemon.Cp { // pokemon is new or CP has changed (encountered or re-encountered)
 			if !locked {
 				pokemonStatsLock.Lock()
 				locked = true
@@ -488,18 +491,18 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 				pokemonCount[area] = countStats
 			}
 
-			formId := int(new.Form.ValueOrZero())
-			pf := pokemonForm{pokemonId: new.PokemonId, formId: formId}
+			formId := int(pokemon.Form.ValueOrZero())
+			pf := pokemonForm{pokemonId: pokemon.PokemonId, formId: formId}
 
-			if old == nil || old.PokemonId != new.PokemonId { // pokemon is new or type has changed
+			if pokemon.isNewRecord() || pokemon.oldValues.PokemonId != pokemon.PokemonId { // pokemon is new or type has changed
 				countStats.count[pf]++
 				statsCollector.IncPokemonCountNew(fullAreaName)
-				if new.ExpireTimestampVerified {
-					statsCollector.UpdateVerifiedTtl(area, new.SeenType, new.ExpireTimestamp)
+				if pokemon.ExpireTimestampVerified {
+					statsCollector.UpdateVerifiedTtl(area, pokemon.SeenType, pokemon.ExpireTimestamp)
 				}
 			}
 
-			if new.Cp.Valid {
+			if pokemon.Cp.Valid {
 				countStats.ivCount[pf]++
 				statsCollector.IncPokemonCountIv(fullAreaName)
 				if isHundo {
@@ -553,7 +556,7 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
-		if old == nil || old.Cp != new.Cp { // pokemon is new or CP has changed (encountered or re-encountered)
+		if pokemon.isNewRecord() || pokemon.oldValues.Cp != pokemon.Cp { // pokemon is new or CP has changed (encountered or re-encountered)
 			if !hourlyLocked {
 				pokemonStatsHourlyLock.Lock()
 				hourlyLocked = true
@@ -571,14 +574,14 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 				pokemonCountHourly[area] = countStats
 			}
 
-			formId := int(new.Form.ValueOrZero())
-			pf := pokemonForm{pokemonId: new.PokemonId, formId: formId}
+			formId := int(pokemon.Form.ValueOrZero())
+			pf := pokemonForm{pokemonId: pokemon.PokemonId, formId: formId}
 
-			if old == nil || old.PokemonId != new.PokemonId { // pokemon is new or type has changed
+			if pokemon.isNewRecord() || pokemon.oldValues.PokemonId != pokemon.PokemonId { // pokemon is new or type has changed
 				countStats.count[pf]++
 			}
 
-			if new.Cp.Valid {
+			if pokemon.Cp.Valid {
 				countStats.ivCount[pf]++
 				if isHundo {
 					countStats.hundos[pf]++
@@ -597,8 +600,8 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 	// Only track if we have pvp results and thresholds are configured
 	if pvpResults != nil && len(config.Config.Pvp.ExcellentPvpRankThreshold) > 0 {
 		excellentPvpStatsHourlyLock.Lock()
-		formId := int(new.Form.ValueOrZero())
-		pf := pokemonForm{pokemonId: new.PokemonId, formId: formId}
+		formId := int(pokemon.Form.ValueOrZero())
+		pf := pokemonForm{pokemonId: pokemon.PokemonId, formId: formId}
 
 		for i := 0; i < len(areas); i++ {
 			area := areas[i]
@@ -640,7 +643,7 @@ func updatePokemonStats(old *Pokemon, new *Pokemon, areas []geo.AreaName, now in
 	}
 }
 
-func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
+func updateRaidStats(gym *Gym, areas []geo.AreaName) {
 	if len(areas) == 0 {
 		areas = []geo.AreaName{{Parent: "unmatched", Name: "unmatched"}}
 	}
@@ -651,8 +654,8 @@ func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
-		if new.RaidPokemonId.ValueOrZero() > 0 &&
-			(old == nil || old.RaidPokemonId != new.RaidPokemonId || old.RaidEndTimestamp != new.RaidEndTimestamp) {
+		if gym.RaidPokemonId.ValueOrZero() > 0 &&
+			(gym.newRecord || gym.oldValues.RaidPokemonId != gym.RaidPokemonId || gym.oldValues.RaidSpawnTimestamp != gym.RaidSpawnTimestamp) {
 
 			if !locked {
 				raidStatsLock.Lock()
@@ -663,15 +666,16 @@ func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
 				raidCount[area] = make(map[int64]*areaRaidCountDetail)
 			}
 			countStats := raidCount[area]
-			raidLevel := new.RaidLevel.ValueOrZero()
+			raidLevel := gym.RaidLevel.ValueOrZero()
 			if countStats[raidLevel] == nil {
-				countStats[raidLevel] = &areaRaidCountDetail{count: make(map[pokemonForm]int)}
+				countStats[raidLevel] = &areaRaidCountDetail{count: make(map[raidPokemonKey]int)}
 			}
-			pf := pokemonForm{
-				pokemonId: int16(new.RaidPokemonId.ValueOrZero()),
-				formId:    int(new.RaidPokemonForm.ValueOrZero()),
+			rk := raidPokemonKey{
+				pokemonId: int16(gym.RaidPokemonId.ValueOrZero()),
+				formId:    int(gym.RaidPokemonForm.ValueOrZero()),
+				tempEvoId: int(gym.RaidPokemonEvolution.ValueOrZero()),
 			}
-			countStats[raidLevel].count[pf]++
+			countStats[raidLevel].count[rk]++
 		}
 	}
 
@@ -685,8 +689,8 @@ func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
-		if new.RaidPokemonId.ValueOrZero() > 0 &&
-			(old == nil || old.RaidPokemonId != new.RaidPokemonId || old.RaidEndTimestamp != new.RaidEndTimestamp) {
+		if gym.RaidPokemonId.ValueOrZero() > 0 &&
+			(gym.newRecord || gym.oldValues.RaidPokemonId != gym.RaidPokemonId || gym.oldValues.RaidEndTimestamp != gym.RaidEndTimestamp) {
 
 			if !hourlyLocked {
 				raidStatsHourlyLock.Lock()
@@ -697,15 +701,16 @@ func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
 				raidCountHourly[area] = make(map[int64]*areaRaidCountDetail)
 			}
 			countStats := raidCountHourly[area]
-			raidLevel := new.RaidLevel.ValueOrZero()
+			raidLevel := gym.RaidLevel.ValueOrZero()
 			if countStats[raidLevel] == nil {
-				countStats[raidLevel] = &areaRaidCountDetail{count: make(map[pokemonForm]int)}
+				countStats[raidLevel] = &areaRaidCountDetail{count: make(map[raidPokemonKey]int)}
 			}
-			pf := pokemonForm{
-				pokemonId: int16(new.RaidPokemonId.ValueOrZero()),
-				formId:    int(new.RaidPokemonForm.ValueOrZero()),
+			rk := raidPokemonKey{
+				pokemonId: int16(gym.RaidPokemonId.ValueOrZero()),
+				formId:    int(gym.RaidPokemonForm.ValueOrZero()),
+				tempEvoId: int(gym.RaidPokemonEvolution.ValueOrZero()),
 			}
-			countStats[raidLevel].count[pf]++
+			countStats[raidLevel].count[rk]++
 		}
 	}
 
@@ -714,7 +719,7 @@ func updateRaidStats(old *Gym, new *Gym, areas []geo.AreaName) {
 	}
 }
 
-func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
+func updateIncidentStats(incident *Incident, areas []geo.AreaName) {
 	if len(areas) == 0 {
 		areas = []geo.AreaName{
 			{
@@ -730,13 +735,15 @@ func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
 	})
 
 	locked := false
+	old := &incident.oldValues
+	isNew := incident.IsNewRecord()
 
 	// Loop though all areas (daily stats)
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
 		// Check if StartTime has changed, then we can assume a new Incident has appeared.
-		if old == nil || old.StartTime != new.StartTime {
+		if isNew || old.StartTime != incident.StartTime {
 
 			if !locked {
 				incidentStatsLock.Lock()
@@ -750,8 +757,8 @@ func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
 			}
 
 			// Exclude Kecleon, Showcases and other UNSET characters for invasionStats.
-			if new.Character != 0 {
-				invasionStats.count[new.Character]++
+			if incident.Character != 0 {
+				invasionStats.count[incident.Character]++
 			}
 		}
 	}
@@ -766,7 +773,7 @@ func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
 	for i := 0; i < len(areas); i++ {
 		area := areas[i]
 
-		if old == nil || old.StartTime != new.StartTime {
+		if isNew || old.StartTime != incident.StartTime {
 
 			if !hourlyLocked {
 				incidentStatsHourlyLock.Lock()
@@ -779,8 +786,8 @@ func updateIncidentStats(old *Incident, new *Incident, areas []geo.AreaName) {
 				invasionCountHourly[area] = invasionStats
 			}
 
-			if new.Character != 0 {
-				invasionStats.count[new.Character]++
+			if incident.Character != 0 {
+				invasionStats.count[incident.Character]++
 			}
 		}
 	}
@@ -1155,6 +1162,7 @@ type raidStatsDbRow struct {
 	Level     int64  `db:"level"`
 	PokemonId int    `db:"pokemon_id"`
 	FormId    int    `db:"form_id"`
+	TempEvoId int    `db:"temp_evo_id"`
 	Count     int    `db:"count"`
 }
 
@@ -1173,14 +1181,15 @@ func logRaidStats(statsDb *sqlx.DB) {
 		midnightString := t.Format("2006-01-02")
 
 		for area, stats := range currentStats {
-			addRows := func(rows *[]raidStatsDbRow, level int64, pokemonId int, formId int, count int) {
+			addRows := func(rows *[]raidStatsDbRow, level int64, rk raidPokemonKey, count int) {
 				*rows = append(*rows, raidStatsDbRow{
 					Date:      midnightString,
 					Area:      area.Parent,
 					Fence:     area.Name,
 					Level:     level,
-					PokemonId: pokemonId,
-					FormId:    formId,
+					PokemonId: int(rk.pokemonId),
+					FormId:    rk.formId,
+					TempEvoId: rk.tempEvoId,
 					Count:     count,
 				})
 			}
@@ -1189,9 +1198,9 @@ func logRaidStats(statsDb *sqlx.DB) {
 				if raidDetail.count == nil {
 					continue // nothing to do
 				}
-				for pf, count := range raidDetail.count {
+				for rk, count := range raidDetail.count {
 					if count > 0 {
-						addRows(&rows, level, int(pf.pokemonId), pf.formId, count)
+						addRows(&rows, level, rk, count)
 					}
 				}
 			}
@@ -1206,8 +1215,8 @@ func logRaidStats(statsDb *sqlx.DB) {
 			batchRows := rows[i:end]
 			_, err := statsDb.NamedExec(
 				"INSERT INTO raid_stats "+
-					"(date, area, fence, level, pokemon_id, form_id, `count`)"+
-					" VALUES (:date, :area, :fence, :level, :pokemon_id, :form_id, :count)"+
+					"(date, area, fence, level, pokemon_id, form_id, temp_evo_id, `count`)"+
+					" VALUES (:date, :area, :fence, :level, :pokemon_id, :form_id, :temp_evo_id, :count)"+
 					" ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`);", batchRows)
 			if err != nil {
 				log.Errorf("Error inserting raid_stats: %v", err)
